@@ -63,6 +63,7 @@ final switch. After a denial or approval, the button becomes **Open Settings…*
 | Fn Lock | Standard F1–F12 vs. icon actions | Keyboard firmware |
 | Right Option → F18 | Convenient macOS input-source shortcut | macOS adaptation |
 | Left Opt ↔ Left Cmd | Mac-style physical modifier order | macOS adaptation |
+| Right Control ↔ Right Option (Alt) | Swaps the right modifiers; off by default; overrides F18 while enabled | macOS adaptation |
 | Scroll Speed | Vertical and horizontal TrackPoint scrolling on USB and Bluetooth | macOS adaptation |
 
 Saved text is stored in macOS user defaults as plain text. Do not put passwords

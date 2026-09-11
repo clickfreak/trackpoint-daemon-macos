@@ -35,12 +35,14 @@
 
 #define HID_LEFT_OPTION   "0x7000000E2"
 #define HID_LEFT_CMD      "0x7000000E3"
+#define HID_RIGHT_CTRL    "0x7000000E4"
 #define HID_RIGHT_OPTION  "0x7000000E6"
 #define HID_F18           "0x70000006D"
 
 #define PREF_SENSITIVITY  @"tpSensitivity"
 #define PREF_F18          @"tpF18Enabled"
 #define PREF_SWAP         @"tpSwapEnabled"
+#define PREF_RIGHT_SWAP   @"tpRightSwapEnabled"
 #define PREF_SCROLL_SPEED @"tpScrollSpeed"
 #define PREF_SCROLL       @"tpPreferredScroll"
 #define PREF_FN_LOCK      @"tpFnLock"
@@ -61,6 +63,7 @@ static uint64_t          s_lastMiddleClickTime = 0;
 
 static bool    s_f18Enabled  = true;
 static bool    s_swapEnabled = true;
+static bool    s_rightSwapEnabled = false;
 static bool    s_enabled     = true;
 static int     s_sensitivity = TP_SENSITIVITY_DEFAULT;  /* 1-9 */
 static double  s_scrollSpeed = SCROLL_SPEED;
@@ -423,6 +426,7 @@ static void native_middle_changed(TPHIDDevice *ctx, bool down) {
 @property (strong) NSTextField *inputStatus;
 @property (strong) NSButton    *f18Check;
 @property (strong) NSButton    *swapCheck;
+@property (strong) NSButton    *rightSwapCheck;
 @property (strong) NSButton    *fnLockCheck;
 @property (strong) NSButton    *preferredCheck;
 @property (strong) NSSlider    *slider;
@@ -662,6 +666,11 @@ static SettingsWindowController *g_settings = nil;
                       target:self action:@selector(toggleSwap:)];
     self.swapCheck.frame = NSMakeRect(224, 35, 214, 20);
     [keysBox addSubview:self.swapCheck];
+    self.rightSwapCheck = [NSButton checkboxWithTitle:@"Right Control ↔ Right Option (Alt)"
+                           target:self action:@selector(toggleRightSwap:)];
+    self.rightSwapCheck.frame = NSMakeRect(14, 12, 410, 20);
+    self.rightSwapCheck.toolTip = @"Overrides Right Option → F18 while enabled.";
+    [keysBox addSubview:self.rightSwapCheck];
 
     NSBox *extrasBox = [[NSBox alloc] initWithFrame:NSMakeRect(18, 56, 452, 58)];
     extrasBox.title = @"macOS TrackPoint Extras";
@@ -735,6 +744,7 @@ static SettingsWindowController *g_settings = nil;
 
     self.f18Check.state  = s_f18Enabled  ? NSControlStateValueOn : NSControlStateValueOff;
     self.swapCheck.state = s_swapEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.rightSwapCheck.state = s_rightSwapEnabled ? NSControlStateValueOn : NSControlStateValueOff;
     self.fnLockCheck.state = s_fnLock ? NSControlStateValueOn : NSControlStateValueOff;
     self.preferredCheck.state = s_preferredScroll ? NSControlStateValueOn : NSControlStateValueOff;
 
@@ -743,8 +753,9 @@ static SettingsWindowController *g_settings = nil;
     self.fastTestButton.enabled = s_enabled && connected;
     self.preferredCheck.enabled = s_enabled;
     self.fnLockCheck.enabled = s_enabled;
-    self.f18Check.enabled = s_enabled;
+    self.f18Check.enabled = s_enabled && !s_rightSwapEnabled;
     self.swapCheck.enabled = s_enabled;
+    self.rightSwapCheck.enabled = s_enabled;
     self.scrollSlider.enabled = s_enabled;
 
     self.slider.integerValue = s_sensitivity;
@@ -811,6 +822,14 @@ static SettingsWindowController *g_settings = nil;
     [[NSUserDefaults standardUserDefaults] setBool:s_swapEnabled forKey:PREF_SWAP];
     apply_key_remap();
     LOG("Left Opt<->Cmd swap: %s", s_swapEnabled ? "ON" : "OFF");
+}
+
+- (void)toggleRightSwap:(NSButton *)btn {
+    s_rightSwapEnabled = (btn.state == NSControlStateValueOn);
+    [[NSUserDefaults standardUserDefaults] setBool:s_rightSwapEnabled forKey:PREF_RIGHT_SWAP];
+    apply_key_remap();
+    [self syncState];
+    LOG("Right Ctrl<->Opt swap: %s", s_rightSwapEnabled ? "ON" : "OFF");
 }
 
 - (void)toggleFnLock:(NSButton *)btn {
@@ -1274,10 +1293,10 @@ static NSImage *status_icon(NSColor *dotColor) {
     reset_gesture_state();
 
     /* Reset the per-device mapping property only on this keyboard model. */
-    bool oldF18 = s_f18Enabled, oldSwap = s_swapEnabled;
-    s_f18Enabled = false; s_swapEnabled = false;
+    bool oldEnabled = s_enabled;
+    s_enabled = false;
     apply_key_remap();
-    s_f18Enabled = oldF18; s_swapEnabled = oldSwap;
+    s_enabled = oldEnabled;
 
     if (s_tap) CGEventTapEnable(s_tap, false);
     if (s_tapSource) {
@@ -1446,9 +1465,7 @@ static void refresh_ui(void) {
 /* ══════════════════════════════════════════════════════════════
    hidutil — kernel-level key remap
    ══════════════════════════════════════════════════════════════ */
-static void apply_key_remap(void) {
-    if (tp_count() == 0) return;
-
+static NSArray<NSString *> *key_remap_items(void) {
     NSMutableArray<NSString *> *items = [NSMutableArray array];
     if (s_enabled && s_swapEnabled) {
         [items addObject:@"{\"HIDKeyboardModifierMappingSrc\":" HID_LEFT_OPTION
@@ -1456,10 +1473,22 @@ static void apply_key_remap(void) {
         [items addObject:@"{\"HIDKeyboardModifierMappingSrc\":" HID_LEFT_CMD
                          ",\"HIDKeyboardModifierMappingDst\":" HID_LEFT_OPTION "}"];
     }
-    if (s_enabled && s_f18Enabled) {
+    if (s_enabled && s_rightSwapEnabled) {
+        [items addObject:@"{\"HIDKeyboardModifierMappingSrc\":" HID_RIGHT_CTRL
+                         ",\"HIDKeyboardModifierMappingDst\":" HID_RIGHT_OPTION "}"];
+        [items addObject:@"{\"HIDKeyboardModifierMappingSrc\":" HID_RIGHT_OPTION
+                         ",\"HIDKeyboardModifierMappingDst\":" HID_RIGHT_CTRL "}"];
+    } else if (s_enabled && s_f18Enabled) {
         [items addObject:@"{\"HIDKeyboardModifierMappingSrc\":" HID_RIGHT_OPTION
                          ",\"HIDKeyboardModifierMappingDst\":" HID_F18 "}"];
     }
+    return items;
+}
+
+static void apply_key_remap(void) {
+    if (tp_count() == 0) return;
+
+    NSArray<NSString *> *items = key_remap_items();
     NSString *mapping = [NSString stringWithFormat:@"{\"UserKeyMapping\":[%@]}",
                          [items componentsJoinedByString:@","]];
 
@@ -2004,6 +2033,26 @@ static void setup_hid(void) {
    main
    ══════════════════════════════════════════════════════════════ */
 static int run_self_test(void) {
+    @autoreleasepool {
+        NSArray<NSString *> *originalMapping = key_remap_items();
+        assert(originalMapping.count == 3);
+        s_rightSwapEnabled = true;
+        NSArray<NSString *> *swappedMapping = key_remap_items();
+        assert(swappedMapping.count == 4);
+        assert([swappedMapping[2] isEqualToString:
+            @"{\"HIDKeyboardModifierMappingSrc\":0x7000000E4,\"HIDKeyboardModifierMappingDst\":0x7000000E6}"]);
+        assert([swappedMapping[3] isEqualToString:
+            @"{\"HIDKeyboardModifierMappingSrc\":0x7000000E6,\"HIDKeyboardModifierMappingDst\":0x7000000E4}"]);
+        s_f18Enabled = false;
+        assert([key_remap_items() isEqualToArray:swappedMapping]);
+        s_enabled = false;
+        assert(key_remap_items().count == 0);
+        s_enabled = true;
+        s_f18Enabled = true;
+        s_rightSwapEnabled = false;
+        assert([key_remap_items() isEqualToArray:originalMapping]);
+    }
+
     TPReportSpec spec;
     uint8_t report[8];
     CFIndex length = 0;
@@ -2073,6 +2122,7 @@ int main(int argc, const char *argv[]) {
             PREF_SENSITIVITY: @(TP_SENSITIVITY_DEFAULT),
             PREF_F18: @YES,
             PREF_SWAP: @YES,
+            PREF_RIGHT_SWAP: @NO,
             PREF_SCROLL_SPEED: @(SCROLL_SPEED),
             PREF_SCROLL: @YES,
             PREF_FN_LOCK: @NO,
@@ -2086,6 +2136,7 @@ int main(int argc, const char *argv[]) {
         s_sensitivity = (int)MAX(1, MIN(9, [ud integerForKey:PREF_SENSITIVITY]));
         s_f18Enabled = [ud boolForKey:PREF_F18];
         s_swapEnabled = [ud boolForKey:PREF_SWAP];
+        s_rightSwapEnabled = [ud boolForKey:PREF_RIGHT_SWAP];
         s_scrollSpeed = MAX(1.0, MIN(8.0, [ud doubleForKey:PREF_SCROLL_SPEED]));
         s_preferredScroll = [ud boolForKey:PREF_SCROLL];
         s_fnLock = [ud boolForKey:PREF_FN_LOCK];
