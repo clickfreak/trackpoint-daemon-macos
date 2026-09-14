@@ -4,7 +4,7 @@
  * Key remap: per-device hidutil — modifier swap and Right Option -> F18
  * Unified CGEventTap at kCGHIDEventTap:
  *   - Middle button → scroll (with accumulator + threshold)
- *   - Software sensitivity fallback
+ *   - Software sensitivity fallback and device-only Windows/Linux navigation
  * Exact-device HID value callback: pointer-origin confirmation
  * Detection/config: IOHIDManager, exact TrackPoint Keyboard II USB/BLE IDs
  *
@@ -17,6 +17,7 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreAudio/CoreAudio.h>
+#import <Carbon/Carbon.h>
 #import <IOKit/hid/IOHIDManager.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
 #import <math.h>
@@ -43,6 +44,7 @@
 #define PREF_F18          @"tpF18Enabled"
 #define PREF_SWAP         @"tpSwapEnabled"
 #define PREF_RIGHT_SWAP   @"tpRightSwapEnabled"
+#define PREF_PC_NAVIGATION @"tpPCNavigation"
 #define PREF_SCROLL_SPEED @"tpScrollSpeed"
 #define PREF_SCROLL       @"tpPreferredScroll"
 #define PREF_FN_LOCK      @"tpFnLock"
@@ -64,6 +66,7 @@ static uint64_t          s_lastMiddleClickTime = 0;
 static bool    s_f18Enabled  = true;
 static bool    s_swapEnabled = true;
 static bool    s_rightSwapEnabled = false;
+static bool    s_pcNavigation = false;
 static bool    s_enabled     = true;
 static int     s_sensitivity = TP_SENSITIVITY_DEFAULT;  /* 1-9 */
 static double  s_scrollSpeed = SCROLL_SPEED;
@@ -94,6 +97,16 @@ static bool s_accessibilityRequestAttempted = false;
 #define TP_RECENCY_NS  50000000ULL   /* 50ms */
 #define NATIVE_DUP_NS  15000000ULL   /* native report vs. compatibility event */
 
+static const CGEventField TP_EVENT_SENDER_ID = (CGEventField)87;
+static const CGKeyCode TP_NAVIGATION_KEYS[] = {
+    kVK_Home, kVK_End, kVK_PageUp, kVK_PageDown,
+};
+
+typedef struct {
+    CGKeyCode key;
+    CGEventFlags flags;
+} TPNavigationPress;
+
 @interface TPHIDDevice : NSObject {
 @public
     IOHIDDeviceRef device;
@@ -107,9 +120,11 @@ static bool s_accessibilityRequestAttempted = false;
     bool nativeMiddleDown;
     bool nativeScrolled;
     bool rawMiddleDown;
+    TPNavigationPress navigation[4];
 }
 - (instancetype)initWithDevice:(IOHIDDeviceRef)hidDevice;
 - (void)resetAfterWake;
+- (void)releaseNavigation;
 @end
 
 static NSMutableArray<TPHIDDevice *> *s_tpDevices;
@@ -401,6 +416,7 @@ static void native_middle_changed(TPHIDDevice *ctx, bool down) {
 }
 
 - (void)resetAfterWake {
+    [self releaseNavigation];
     inputConfirmed = false;
     lastPointerTime = 0;
     lastMiddleButtonTime = 0;
@@ -408,6 +424,20 @@ static void native_middle_changed(TPHIDDevice *ctx, bool down) {
     bleVerticalPending = false;
     lastNativeMiddleTime = 0;
     lastHotkey = 0;
+}
+
+- (void)releaseNavigation {
+    for (size_t index = 0; index < 4; index++) {
+        TPNavigationPress *press = &navigation[index];
+        if (!press->key) continue;
+        CGEventRef up = CGEventCreateKeyboardEvent(NULL, press->key, false);
+        if (up) {
+            CGEventSetFlags(up, press->flags);
+            CGEventPost(kCGSessionEventTap, up);
+            CFRelease(up);
+        }
+        *press = (TPNavigationPress){0};
+    }
 }
 
 - (void)dealloc {
@@ -427,6 +457,7 @@ static void native_middle_changed(TPHIDDevice *ctx, bool down) {
 @property (strong) NSButton    *f18Check;
 @property (strong) NSButton    *swapCheck;
 @property (strong) NSButton    *rightSwapCheck;
+@property (strong) NSButton    *navigationCheck;
 @property (strong) NSButton    *fnLockCheck;
 @property (strong) NSButton    *preferredCheck;
 @property (strong) NSSlider    *slider;
@@ -650,29 +681,34 @@ static SettingsWindowController *g_settings = nil;
     permissionHelp.frame = NSMakeRect(14, 13, 422, 16);
     [permissionsBox addSubview:permissionHelp];
 
-    NSBox *keysBox = [[NSBox alloc] initWithFrame:NSMakeRect(18, 126, 452, 104)];
+    NSBox *keysBox = [[NSBox alloc] initWithFrame:NSMakeRect(18, 103, 452, 127)];
     keysBox.title = @"Keyboard Options";
     [macView addSubview:keysBox];
 
     self.fnLockCheck = [NSButton checkboxWithTitle:@"Fn Lock (F1–F12 standard keys)"
                        target:self action:@selector(toggleFnLock:)];
-    self.fnLockCheck.frame = NSMakeRect(14, 58, 410, 20);
+    self.fnLockCheck.frame = NSMakeRect(14, 81, 410, 20);
     [keysBox addSubview:self.fnLockCheck];
     self.f18Check = [NSButton checkboxWithTitle:@"Right Option → F18"
                      target:self action:@selector(toggleF18:)];
-    self.f18Check.frame = NSMakeRect(14, 35, 200, 20);
+    self.f18Check.frame = NSMakeRect(14, 58, 200, 20);
     [keysBox addSubview:self.f18Check];
     self.swapCheck = [NSButton checkboxWithTitle:@"Left Option ↔ Left Command"
                       target:self action:@selector(toggleSwap:)];
-    self.swapCheck.frame = NSMakeRect(224, 35, 214, 20);
+    self.swapCheck.frame = NSMakeRect(224, 58, 214, 20);
     [keysBox addSubview:self.swapCheck];
     self.rightSwapCheck = [NSButton checkboxWithTitle:@"Right Control ↔ Right Option (Alt)"
                            target:self action:@selector(toggleRightSwap:)];
-    self.rightSwapCheck.frame = NSMakeRect(14, 12, 410, 20);
+    self.rightSwapCheck.frame = NSMakeRect(14, 35, 410, 20);
     self.rightSwapCheck.toolTip = @"Overrides Right Option → F18 while enabled.";
     [keysBox addSubview:self.rightSwapCheck];
+    self.navigationCheck = [NSButton checkboxWithTitle:@"Windows/Linux Home, End, Page Up/Down"
+                            target:self action:@selector(toggleNavigation:)];
+    self.navigationCheck.frame = NSMakeRect(14, 12, 410, 20);
+    self.navigationCheck.toolTip = @"Home/End move within the line; Control jumps to document ends. Page Up/Down move the cursor. Shift selects.";
+    [keysBox addSubview:self.navigationCheck];
 
-    NSBox *extrasBox = [[NSBox alloc] initWithFrame:NSMakeRect(18, 56, 452, 58)];
+    NSBox *extrasBox = [[NSBox alloc] initWithFrame:NSMakeRect(18, 33, 452, 58)];
     extrasBox.title = @"macOS TrackPoint Extras";
     [macView addSubview:extrasBox];
 
@@ -745,6 +781,7 @@ static SettingsWindowController *g_settings = nil;
     self.f18Check.state  = s_f18Enabled  ? NSControlStateValueOn : NSControlStateValueOff;
     self.swapCheck.state = s_swapEnabled ? NSControlStateValueOn : NSControlStateValueOff;
     self.rightSwapCheck.state = s_rightSwapEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.navigationCheck.state = s_pcNavigation ? NSControlStateValueOn : NSControlStateValueOff;
     self.fnLockCheck.state = s_fnLock ? NSControlStateValueOn : NSControlStateValueOff;
     self.preferredCheck.state = s_preferredScroll ? NSControlStateValueOn : NSControlStateValueOff;
 
@@ -756,6 +793,7 @@ static SettingsWindowController *g_settings = nil;
     self.f18Check.enabled = s_enabled && !s_rightSwapEnabled;
     self.swapCheck.enabled = s_enabled;
     self.rightSwapCheck.enabled = s_enabled;
+    self.navigationCheck.enabled = s_enabled;
     self.scrollSlider.enabled = s_enabled;
 
     self.slider.integerValue = s_sensitivity;
@@ -830,6 +868,13 @@ static SettingsWindowController *g_settings = nil;
     apply_key_remap();
     [self syncState];
     LOG("Right Ctrl<->Opt swap: %s", s_rightSwapEnabled ? "ON" : "OFF");
+}
+
+- (void)toggleNavigation:(NSButton *)btn {
+    s_pcNavigation = (btn.state == NSControlStateValueOn);
+    [[NSUserDefaults standardUserDefaults] setBool:s_pcNavigation forKey:PREF_PC_NAVIGATION];
+    for (TPHIDDevice *ctx in s_tpDevices) [ctx releaseNavigation];
+    LOG("Windows/Linux navigation: %s", s_pcNavigation ? "ON" : "OFF");
 }
 
 - (void)toggleFnLock:(NSButton *)btn {
@@ -1287,6 +1332,7 @@ static NSImage *status_icon(NSColor *dotColor) {
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
+    for (TPHIDDevice *ctx in s_tpDevices) [ctx releaseNavigation];
     [self.accessTimer invalidate];
     [s_imTimer invalidate];
     [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
@@ -1399,6 +1445,7 @@ static NSImage *status_icon(NSColor *dotColor) {
 
 - (void)toggleEnabled:(id)sender {
     (void)sender;
+    for (TPHIDDevice *ctx in s_tpDevices) [ctx releaseNavigation];
     s_enabled = !s_enabled;
     [[NSUserDefaults standardUserDefaults] setBool:s_enabled forKey:PREF_ENABLED];
     reset_gesture_state();
@@ -1805,11 +1852,74 @@ static CGPoint clamp_to_active_display(CGPoint point) {
    Unified CGEventTap at kCGHIDEventTap
    Handles: Preferred Scrolling fallback and software sensitivity fallback
    ══════════════════════════════════════════════════════════════ */
+static TPHIDDevice *keyboard_event_device(CGEventRef event) {
+    uint64_t senderID = (uint64_t)CGEventGetIntegerValueField(event, TP_EVENT_SENDER_ID);
+    if (!senderID || tp_count() == 0) return nil;
+    io_registry_entry_t entry = IOServiceGetMatchingService(kIOMainPortDefault,
+        IORegistryEntryIDMatching(senderID));
+    while (entry) {
+        for (TPHIDDevice *ctx in s_tpDevices) {
+            if (IOObjectIsEqualTo(entry, IOHIDDeviceGetService(ctx->device))) {
+                IOObjectRelease(entry);
+                return ctx;
+            }
+        }
+        io_registry_entry_t parent = IO_OBJECT_NULL;
+        IOReturn result = IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent);
+        IOObjectRelease(entry);
+        entry = result == KERN_SUCCESS ? parent : IO_OBJECT_NULL;
+    }
+    return nil;
+}
+
+static bool navigation_binding(CGKeyCode *key, CGEventFlags *flags) {
+    if (*flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate)) return false;
+    bool control = (*flags & kCGEventFlagMaskControl) != 0;
+    CGEventFlags modifiers = *flags & ~(kCGEventFlagMaskControl |
+        kCGEventFlagMaskSecondaryFn | (CGEventFlags)0xFFFF);
+    switch (*key) {
+        case kVK_Home:
+            *key = control ? kVK_UpArrow : kVK_LeftArrow;
+            modifiers |= kCGEventFlagMaskCommand;
+            break;
+        case kVK_End:
+            *key = control ? kVK_DownArrow : kVK_RightArrow;
+            modifiers |= kCGEventFlagMaskCommand;
+            break;
+        case kVK_PageUp:
+        case kVK_PageDown:
+            if (control) return false;
+            if (!(modifiers & kCGEventFlagMaskShift)) modifiers |= kCGEventFlagMaskAlternate;
+            break;
+        default:
+            return false;
+    }
+    *flags = modifiers;
+    return true;
+}
+
+static void remap_navigation_event(TPHIDDevice *ctx, size_t index, CGEventRef event) {
+    TPNavigationPress *press = &ctx->navigation[index];
+    if (!press->key) {
+        if (!s_enabled || !s_pcNavigation || CGEventGetType(event) != kCGEventKeyDown ||
+            CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat)) return;
+        CGKeyCode key = TP_NAVIGATION_KEYS[index];
+        CGEventFlags flags = CGEventGetFlags(event);
+        if (!navigation_binding(&key, &flags)) return;
+        *press = (TPNavigationPress){key, flags};
+    }
+    CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, press->key);
+    CGEventSetFlags(event, press->flags);
+    CGEventKeyboardSetUnicodeString(event, 0, NULL);
+    if (CGEventGetType(event) == kCGEventKeyUp) *press = (TPNavigationPress){0};
+}
+
 static CGEventRef unified_callback(CGEventTapProxy proxy, CGEventType type,
                                     CGEventRef event, void *refcon) {
     (void)proxy; (void)refcon;
 
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        for (TPHIDDevice *ctx in s_tpDevices) [ctx releaseNavigation];
         reset_gesture_state();
         if (s_tap && s_enabled && tp_count() > 0) CGEventTapEnable(s_tap, true);
         LOG("event tap recovered after %s",
@@ -1818,6 +1928,17 @@ static CGEventRef unified_callback(CGEventTapProxy proxy, CGEventType type,
     }
 
     if (!s_enabled) return event;
+
+    if (type == kCGEventKeyDown || type == kCGEventKeyUp) {
+        CGKeyCode key = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        for (size_t index = 0; index < 4; index++) {
+            if (key != TP_NAVIGATION_KEYS[index]) continue;
+            TPHIDDevice *ctx = keyboard_event_device(event);
+            if (ctx) remap_navigation_event(ctx, index, event);
+            break;
+        }
+        return event;
+    }
 
     if (type == kCGEventScrollWheel) {
         if (!s_preferredScroll || !consume_ble_vertical_scroll()) return event;
@@ -1938,6 +2059,8 @@ static void try_create_event_tap(void) {
     if (s_tap) return;
 
     CGEventMask mask =
+        CGEventMaskBit(kCGEventKeyDown)           |
+        CGEventMaskBit(kCGEventKeyUp)             |
         CGEventMaskBit(kCGEventOtherMouseDown)    |
         CGEventMaskBit(kCGEventOtherMouseUp)      |
         CGEventMaskBit(kCGEventScrollWheel)       |
@@ -1992,6 +2115,7 @@ static void hid_removed(void *ctx, IOReturn r, void *sender, IOHIDDeviceRef dev)
             return candidate->device == dev;
     }];
     if (index == NSNotFound) return;
+    [s_tpDevices[index] releaseNavigation];
     [s_tpDevices removeObjectAtIndex:index];
     reset_gesture_state();
     s_hardwareSensitivity = false;
@@ -2034,6 +2158,73 @@ static void setup_hid(void) {
    ══════════════════════════════════════════════════════════════ */
 static int run_self_test(void) {
     @autoreleasepool {
+        const struct {
+            CGKeyCode input, output;
+            CGEventFlags flags, outputFlags;
+            bool mapped;
+        } navigationCases[] = {
+            {kVK_Home, kVK_LeftArrow, 0, kCGEventFlagMaskCommand, true},
+            {kVK_End, kVK_RightArrow, 0, kCGEventFlagMaskCommand, true},
+            {kVK_Home, kVK_UpArrow, kCGEventFlagMaskControl, kCGEventFlagMaskCommand, true},
+            {kVK_End, kVK_DownArrow, kCGEventFlagMaskControl, kCGEventFlagMaskCommand, true},
+            {kVK_PageUp, kVK_PageUp, 0, kCGEventFlagMaskAlternate, true},
+            {kVK_PageDown, kVK_PageDown, 0, kCGEventFlagMaskAlternate, true},
+            {kVK_PageUp, kVK_PageUp, kCGEventFlagMaskControl, kCGEventFlagMaskControl, false},
+            {kVK_PageDown, kVK_PageDown, kCGEventFlagMaskControl, kCGEventFlagMaskControl, false},
+            {kVK_Home, kVK_Home, kCGEventFlagMaskCommand, kCGEventFlagMaskCommand, false},
+            {kVK_End, kVK_End, kCGEventFlagMaskAlternate, kCGEventFlagMaskAlternate, false},
+            {kVK_ANSI_A, kVK_ANSI_A, 0, 0, false},
+        };
+        for (size_t index = 0; index < sizeof(navigationCases) / sizeof(navigationCases[0]); index++) {
+            for (int selection = 0; selection < 2; selection++) {
+                CGKeyCode key = navigationCases[index].input;
+                CGEventFlags shift = selection ? kCGEventFlagMaskShift : 0;
+                CGEventFlags flags = navigationCases[index].flags | shift;
+                CGEventFlags expected = navigationCases[index].outputFlags | shift;
+                if (selection && navigationCases[index].mapped &&
+                    (key == kVK_PageUp || key == kVK_PageDown))
+                    expected &= ~kCGEventFlagMaskAlternate;
+                assert(navigation_binding(&key, &flags) == navigationCases[index].mapped);
+                assert(key == navigationCases[index].output && flags == expected);
+            }
+        }
+        CGKeyCode key = kVK_Home;
+        CGEventFlags flags = kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn | 1;
+        assert(navigation_binding(&key, &flags));
+        assert(key == kVK_UpArrow && flags == kCGEventFlagMaskCommand);
+
+        TPHIDDevice *keyboard = [TPHIDDevice new];
+        CGEventRef navigationEvent = CGEventCreateKeyboardEvent(NULL, kVK_Home, true);
+        assert(navigationEvent);
+        CGEventSetFlags(navigationEvent, 0);
+        remap_navigation_event(keyboard, 0, navigationEvent);
+        assert(CGEventGetIntegerValueField(navigationEvent, kCGKeyboardEventKeycode) == kVK_Home);
+        s_pcNavigation = true;
+        s_enabled = false;
+        remap_navigation_event(keyboard, 0, navigationEvent);
+        assert(!keyboard->navigation[0].key);
+        s_enabled = true;
+        CGEventSetIntegerValueField(navigationEvent, TP_EVENT_SENDER_ID, 0);
+        assert(!keyboard_event_device(navigationEvent));
+        unified_callback(NULL, kCGEventKeyDown, navigationEvent, NULL);
+        assert(CGEventGetIntegerValueField(navigationEvent, kCGKeyboardEventKeycode) == kVK_Home);
+        remap_navigation_event(keyboard, 0, navigationEvent);
+        assert(CGEventGetIntegerValueField(navigationEvent, kCGKeyboardEventKeycode) == kVK_LeftArrow);
+        CGEventSetIntegerValueField(navigationEvent, kCGKeyboardEventKeycode, kVK_Home);
+        CGEventSetIntegerValueField(navigationEvent, kCGKeyboardEventAutorepeat, 1);
+        CGEventSetFlags(navigationEvent, kCGEventFlagMaskControl);
+        remap_navigation_event(keyboard, 0, navigationEvent);
+        assert(CGEventGetIntegerValueField(navigationEvent, kCGKeyboardEventKeycode) == kVK_LeftArrow);
+        CGEventSetType(navigationEvent, kCGEventKeyUp);
+        CGEventSetIntegerValueField(navigationEvent, kCGKeyboardEventKeycode, kVK_Home);
+        CGEventSetFlags(navigationEvent, 0);
+        remap_navigation_event(keyboard, 0, navigationEvent);
+        assert(CGEventGetIntegerValueField(navigationEvent, kCGKeyboardEventKeycode) == kVK_LeftArrow);
+        assert(CGEventGetFlags(navigationEvent) == kCGEventFlagMaskCommand);
+        assert(!keyboard->navigation[0].key);
+        CFRelease(navigationEvent);
+        s_pcNavigation = false;
+
         NSArray<NSString *> *originalMapping = key_remap_items();
         assert(originalMapping.count == 3);
         s_rightSwapEnabled = true;
@@ -2123,6 +2314,7 @@ int main(int argc, const char *argv[]) {
             PREF_F18: @YES,
             PREF_SWAP: @YES,
             PREF_RIGHT_SWAP: @NO,
+            PREF_PC_NAVIGATION: @NO,
             PREF_SCROLL_SPEED: @(SCROLL_SPEED),
             PREF_SCROLL: @YES,
             PREF_FN_LOCK: @NO,
@@ -2137,6 +2329,7 @@ int main(int argc, const char *argv[]) {
         s_f18Enabled = [ud boolForKey:PREF_F18];
         s_swapEnabled = [ud boolForKey:PREF_SWAP];
         s_rightSwapEnabled = [ud boolForKey:PREF_RIGHT_SWAP];
+        s_pcNavigation = [ud boolForKey:PREF_PC_NAVIGATION];
         s_scrollSpeed = MAX(1.0, MIN(8.0, [ud doubleForKey:PREF_SCROLL_SPEED]));
         s_preferredScroll = [ud boolForKey:PREF_SCROLL];
         s_fnLock = [ud boolForKey:PREF_FN_LOCK];
@@ -2155,11 +2348,11 @@ int main(int argc, const char *argv[]) {
             s_f12Files = [validFiles copy];
         }
 
-        LOG("prefs: enabled=%s sensitivity=%d scroll=%.1f preferred=%s fnLock=%s f18=%s swap=%s",
+        LOG("prefs: enabled=%s sensitivity=%d scroll=%.1f preferred=%s fnLock=%s f18=%s swap=%s pcNavigation=%s",
             s_enabled ? "on" : "paused", s_sensitivity, s_scrollSpeed,
             s_preferredScroll ? "on" : "off",
             s_fnLock ? "on" : "off", s_f18Enabled ? "on" : "off",
-            s_swapEnabled ? "on" : "off");
+            s_swapEnabled ? "on" : "off", s_pcNavigation ? "on" : "off");
 
         NSApplication *app = [NSApplication sharedApplication];
         app.activationPolicy = NSApplicationActivationPolicyAccessory;

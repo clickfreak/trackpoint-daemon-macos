@@ -64,10 +64,35 @@ final switch. After a denial or approval, the button becomes **Open Settings…*
 | Right Option → F18 | Convenient macOS input-source shortcut | macOS adaptation |
 | Left Opt ↔ Left Cmd | Mac-style physical modifier order | macOS adaptation |
 | Right Control ↔ Right Option (Alt) | Swaps the right modifiers; off by default; overrides F18 while enabled | macOS adaptation |
+| Windows/Linux Home, End, Page Up/Down | Line/document navigation and cursor-moving pages; off by default | macOS adaptation |
 | Scroll Speed | Vertical and horizontal TrackPoint scrolling on USB and Bluetooth | macOS adaptation |
 
 Saved text is stored in macOS user defaults as plain text. Do not put passwords
 or sensitive personal information in the F12 text action.
+
+**Windows/Linux navigation** applies only to identified TrackPoint Keyboard II
+events and requires Accessibility and Input Monitoring. It translates:
+
+| Hardware keys | macOS shortcut sent |
+|---|---|
+| Home / End | Command–Left / Right (line start/end) |
+| Control–Home / End | Command–Up / Down (document start/end) |
+| Page Up / Down | Option–Page Up / Down (move the cursor by a page) |
+| Shift plus Home / End, including Control | Shift plus the corresponding shortcut above |
+| Shift–Page Up / Down | Unchanged (page selection) |
+
+Option/Command combinations and Control–Page Up/Down remain unchanged. Control
+means the logical Control key after modifier swaps. Apps with custom shortcuts,
+terminals, and remote desktops may interpret these shortcuts differently; turn
+the option off there if they already provide PC-style navigation.
+
+Device identification uses the undocumented CGEvent sender registry-ID field
+87, checked against the manager's matched HID devices and their descendant
+services. If macOS omits that ID or it cannot be matched, navigation stays
+unchanged rather than affecting another keyboard. No global key-binding file
+is installed. The field is described in [the discoverer's report](https://stackoverflow.com/questions/219623/device-information-from-nsevent-cgevent);
+the text-navigation shortcuts follow [Apple's keyboard shortcuts](https://support.apple.com/en-us/102650)
+and AppKit's built-in `StandardKeyBinding.dict`.
 
 ## What Lenovo's Windows program actually provides
 
@@ -194,6 +219,7 @@ other keyboard, global mouse setting, or privacy permission is changed.
 | Middle click | Hold pending; emit click only if no wheel report/movement occurred |
 | F12 and Lenovo hotkeys | Exact-device input-report callback |
 | Key remaps | `hidutil --matching` for this model only |
+| Windows/Linux navigation | Same HID event tap, sender registry-ID matching, native macOS shortcuts |
 | Pointer-origin confirmation | Manager-owned exact-device X/Y callback; no secondary HID queue |
 | Software sensitivity fallback | One `kCGHIDEventTap`, fail-closed origin filter |
 
